@@ -25,6 +25,7 @@ Run:
 """
 
 import os
+import json
 import uuid
 
 import google.auth
@@ -45,11 +46,11 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-RESOURCE = os.environ["AGENT_ENGINE_RESOURCE_NAME"]
+RESOURCE = os.environ.get("AGENT_ENGINE_RESOURCE_NAME", "projects/991533730243/locations/us-east1/reasoningEngines/1231217727620775936")
 # The agent's app directory (matches agent_directory in agents-cli-manifest.yaml).
 AGENT_DIRECTORY = os.environ.get("AGENT_DIRECTORY", "app")
 # Location is embedded in the resource name: projects/<p>/locations/<loc>/reasoningEngines/<id>.
-LOCATION = RESOURCE.split("/locations/")[1].split("/")[0]
+LOCATION = RESOURCE.split("/locations/")[1].split("/")[0] if "/locations/" in RESOURCE else "us-east1"
 
 # A2A endpoint for an Agent Runtime deployment, via the Agent Engine HTTP
 # passthrough. The card lives at the well-known path under this base.
@@ -81,10 +82,6 @@ app = FastAPI()
 
 @app.exception_handler(Exception)
 async def _json_errors(request: Request, exc: Exception):
-    # Always return JSON so the browser never receives a plain-text 500 page
-    # (which shows up in the chat as "Unexpected token 'I', "Internal S"... is
-    # not valid JSON"). Any server-side failure now surfaces as a readable
-    # message in the chat bubble instead.
     return JSONResponse(
         status_code=200,
         content={
@@ -105,21 +102,12 @@ async def _get_card(client: httpx.AsyncClient) -> AgentCard:
         resp = await client.get(A2A_CARD_URL)
         resp.raise_for_status()
         card = AgentCard(**resp.json())
-        # Agent Runtime does not serve a public card URL, so point the client at
-        # the passthrough base for message sends.
         card.url = A2A_BASE
         _card = card
     return _card
 
 
 def _extract_parts(parts: list) -> list[dict]:
-    """Turn A2A response parts into structured parts for the chat UI.
-
-    Text parts pass through as {"kind": "text"}. A2UI data parts (tagged
-    application/json+a2ui) become {"kind": "a2ui", "data": <message>} so the UI
-    renders the card; each data part is one A2UI message (beginRendering or
-    surfaceUpdate).
-    """
     out: list[dict] = []
     for p in parts:
         root = getattr(p, "root", p)
@@ -167,23 +155,30 @@ async def chat(req: Request):
         last_task = None
         got_artifact_update = False
         async for event in a2a_client.send_message(msg):
-            if not isinstance(event, tuple):
-                continue
-            task, update = event
-            if task is not None:
-                last_task = task
-                if getattr(task, "context_id", None):
-                    _contexts[user_id] = task.context_id
-            if isinstance(update, TaskArtifactUpdateEvent):
-                got_artifact_update = True
-                parts.extend(_extract_parts(update.artifact.parts))
+            if isinstance(event, Message):
+                parts.extend(_extract_parts(event.parts))
+            elif isinstance(event, tuple):
+                task, update = event
+                if task is not None:
+                    last_task = task
+                    if getattr(task, "context_id", None):
+                        _contexts[user_id] = task.context_id
+                    if hasattr(task, "parts") and task.parts:
+                        parts.extend(_extract_parts(task.parts))
+                    if hasattr(task, "status") and hasattr(task.status, "message") and getattr(task.status.message, "parts", None):
+                        parts.extend(_extract_parts(task.status.message.parts))
+                if isinstance(update, TaskArtifactUpdateEvent):
+                    got_artifact_update = True
+                    parts.extend(_extract_parts(update.artifact.parts))
+                elif isinstance(update, Message):
+                    parts.extend(_extract_parts(update.parts))
 
-        # Non-streaming fallback: pull parts from the final task's artifacts.
-        if not got_artifact_update and last_task is not None:
+        # Fallback: pull parts from the final task's artifacts or status message.
+        if not parts and last_task is not None:
             for artifact in getattr(last_task, "artifacts", None) or []:
                 parts.extend(_extract_parts(artifact.parts))
 
-    # Deduplicate parts to avoid sending duplicate messages to UI
+    # Deduplicate parts
     unique_parts: list[dict] = []
     seen_keys: set[tuple] = set()
     for p in parts:
@@ -199,18 +194,14 @@ async def chat(req: Request):
     parts = unique_parts
 
     if not parts:
-        # The turn produced no text or UI (e.g. the agent only ran tools, or a
-        # tool stalled). Be honest rather than silent.
         parts = [{"kind": "text", "text": "(The agent didn't return a reply.)"}]
     return JSONResponse({"parts": parts})
 
 
-# Serve the chat UI (keep this mount last so /chat wins).
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="static")
 
 
 if __name__ == "__main__":
     import uvicorn
-
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
